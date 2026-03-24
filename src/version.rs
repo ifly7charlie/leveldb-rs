@@ -92,8 +92,10 @@ impl Version {
                         && self.user_cmp.cmp(foundkey, ukey) == Ordering::Equal
                     {
                         return Ok(Some((v, stats)));
-                    } else if typ == ValueType::TypeDeletion {
-                        // Skip looking once we have found a deletion.
+                    } else if typ == ValueType::TypeDeletion
+                        && self.user_cmp.cmp(foundkey, ukey) == Ordering::Equal
+                    {
+                        // Skip looking once we have found a deletion for the same key.
                         return Ok(None);
                     }
                 }
@@ -731,11 +733,13 @@ mod tests {
     use super::testutil::*;
     use super::*;
 
+    use crate::cache::Cache;
     use crate::cmp::DefaultCmp;
     use crate::error::Result;
     use crate::merging_iter::MergingIter;
     use crate::options;
     use crate::test_util::{test_iterator_properties, LdbIteratorIter};
+    use crate::types::share;
 
     #[test]
     fn test_version_concat_iter() {
@@ -1060,5 +1064,46 @@ mod tests {
             &[6, 0, 1],
             &[7, 0, 1]
         ));
+    }
+
+    #[test]
+    fn test_version_get_deletion_wrong_key() {
+        // File 101 (older): contains key3 and key4 with values.
+        // File 102 (newer): contains key1, key2 as values and key5 as a deletion.
+        //   Its key range (key1–key5) includes key3 and key4.
+        // get("key3") must NOT be fooled by the key5 deletion in file 102.
+        let opts = options::for_test();
+        let env = opts.env.clone();
+
+        let older = write_table(
+            env.as_ref().as_ref(),
+            &[
+                (b"key3", b"val3", ValueType::TypeValue),
+                (b"key4", b"val4", ValueType::TypeValue),
+            ],
+            10,
+            101,
+        );
+        let newer = write_table(
+            env.as_ref().as_ref(),
+            &[
+                (b"key1", b"val1", ValueType::TypeValue),
+                (b"key2", b"val2", ValueType::TypeValue),
+                (b"key5", b"", ValueType::TypeDeletion),
+            ],
+            20,
+            102,
+        );
+
+        let cache = TableCache::new("db", opts.clone(), share(Cache::new(128)), 100);
+        let mut v = Version::new(share(cache), Rc::new(Box::new(DefaultCmp)));
+        // Level-0: both files; 102 > 101 so get_overlapping will check 102 first.
+        v.files[0] = vec![older, newer];
+
+        let result = v.get(LookupKey::new(b"key3", 30).internal_key());
+        assert!(
+            result.unwrap().is_some(),
+            "key3 should be found despite key5 deletion in newer file"
+        );
     }
 }
