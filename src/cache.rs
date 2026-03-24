@@ -404,4 +404,80 @@ mod tests {
         assert_eq!(lru.remove_last(), None);
         assert_eq!(lru.remove_last(), None);
     }
+
+    #[test]
+    fn test_blockcache_lru_remove_tail_then_remove_last() {
+        // Removing the tail via remove() must keep head.prev valid so that
+        // a subsequent remove_last() doesn't follow a dangling pointer.
+        let mut lru = LRUList::<usize>::new();
+
+        let h1 = lru.insert(1); // tail (LRU)
+        lru.insert(2);
+        lru.insert(3); // head (MRU)
+        // List order head→tail: 3, 2, 1
+
+        // Remove tail via handle
+        assert_eq!(1, lru.remove(h1));
+        assert_eq!(lru.count(), 2);
+
+        // remove_last must now return 2 (the new tail), not crash
+        assert_eq!(Some(2), lru.remove_last());
+        assert_eq!(Some(3), lru.remove_last());
+        assert_eq!(None, lru.remove_last());
+    }
+
+    #[test]
+    fn test_blockcache_lru_remove_only_element_then_reuse() {
+        // Removing the sole element via remove() must leave the list in a
+        // clean empty state so that subsequent inserts and removals work.
+        let mut lru = LRUList::<usize>::new();
+
+        let h1 = lru.insert(1);
+        assert_eq!(1, lru.remove(h1));
+        assert_eq!(lru.count(), 0);
+
+        // List should behave as empty — insert and remove_last must work
+        lru.insert(10);
+        lru.insert(20);
+        assert_eq!(Some(10), lru.remove_last());
+        assert_eq!(Some(20), lru.remove_last());
+        assert_eq!(None, lru.remove_last());
+    }
+
+    #[test]
+    fn test_blockcache_cache_remove_tail_then_evict() {
+        // Simulates what happens during compaction: TableCache removes a
+        // cache entry (which may be the LRU tail), then later inserts push
+        // the cache past capacity, triggering remove_last() eviction.
+        let mut cache = Cache::new(3);
+
+        let k1 = make_key(1, 0, 0);
+        let k2 = make_key(2, 0, 0);
+        let k3 = make_key(3, 0, 0);
+        let k4 = make_key(4, 0, 0);
+        let k5 = make_key(5, 0, 0);
+
+        cache.insert(&k1, 1); // tail (LRU)
+        cache.insert(&k2, 2);
+        cache.insert(&k3, 3);
+        assert_eq!(cache.count(), 3);
+
+        // Remove the LRU tail entry (simulates TableCache invalidation)
+        assert_eq!(cache.remove(&k1), Some(1));
+        assert_eq!(cache.count(), 2);
+
+        // Fill back to capacity
+        cache.insert(&k4, 4);
+        assert_eq!(cache.count(), 3);
+
+        // This insert must evict via remove_last() without crashing
+        cache.insert(&k5, 5);
+        assert_eq!(cache.count(), 3);
+
+        // k2 was the oldest remaining and should have been evicted
+        assert_eq!(cache.get(&k2), None);
+        assert!(cache.get(&k3).is_some());
+        assert!(cache.get(&k4).is_some());
+        assert!(cache.get(&k5).is_some());
+    }
 }
