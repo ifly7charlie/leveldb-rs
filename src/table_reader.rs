@@ -198,7 +198,7 @@ impl Table {
 
         let handle;
         if let Some((last_in_block, h)) = current_key_val(&index_iter) {
-            if self.opt.cmp.cmp(key, &last_in_block) == Ordering::Less {
+            if self.opt.cmp.cmp(key, &last_in_block) != Ordering::Greater {
                 handle = BlockHandle::decode(&h).unwrap().0;
             } else {
                 return Ok(None);
@@ -794,5 +794,39 @@ mod tests {
 
             panic!("Should have hit 5th record in table!");
         }
+    }
+
+    #[test]
+    fn test_table_get_key_equals_separator() {
+        // Build a table where user key "abc" appears in two consecutive blocks.
+        // With block_size=16, abc|5 and abc|3 land in separate blocks.
+        // The separator for block 0 = find_shortest_sep(abc|5, abc|3) = abc|5
+        // (same user key -> separator equals last key of block 0).
+        // Table::get(LookupKey("abc", 5)) should find abc|5 in block 0.
+        let mut d = Vec::with_capacity(256);
+        let mut opt = options::for_test();
+        opt.block_restart_interval = 1;
+        opt.block_size = 16;
+
+        let key5 = LookupKey::new(b"abc", 5).internal_key().to_vec();
+        let key3 = LookupKey::new(b"abc", 3).internal_key().to_vec();
+
+        {
+            let mut b = TableBuilder::new(opt.clone(), &mut d);
+            b.add(&key5, b"val5").unwrap();
+            b.add(&key3, b"val3").unwrap();
+            b.finish().unwrap();
+        }
+
+        let size = d.len();
+        let bc = share(Cache::new(128));
+        let table = Table::new(opt, bc, wrap_buffer(d), size).unwrap();
+
+        let lookup = LookupKey::new(b"abc", 5);
+        let result = table.get(lookup.internal_key()).unwrap();
+        assert!(
+            result.is_some(),
+            "abc should be found even when lookup key equals block separator"
+        );
     }
 }
