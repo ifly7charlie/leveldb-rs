@@ -265,14 +265,14 @@ impl Version {
     ) -> bool {
         assert!(level < NUM_LEVELS);
         if level == 0 {
-            some_file_overlaps_range_disjoint(
+            some_file_overlaps_range(
                 &InternalKeyCmp(self.user_cmp.clone()),
                 &self.files[level],
                 smallest,
                 largest,
             )
         } else {
-            some_file_overlaps_range(
+            some_file_overlaps_range_disjoint(
                 &InternalKeyCmp(self.user_cmp.clone()),
                 &self.files[level],
                 smallest,
@@ -1104,6 +1104,29 @@ mod tests {
         assert!(
             result.unwrap().is_some(),
             "key3 should be found despite key5 deletion in newer file"
+        );
+    }
+
+    #[test]
+    fn test_overlap_in_level_unsorted_l0() {
+        // Level-0 files stored in non-key-sorted order (file_m_z first, file_a_g second).
+        // Binary search (the buggy path) will erroneously report no overlap for range [b,c].
+        let opts = options::for_test();
+
+        // file_m_z covers user keys maa–zzz
+        let file_m_z = new_file(100, b"maa", 1, b"zzz", 2);
+        // file_a_g covers user keys aaa–gzz
+        let file_a_g = new_file(101, b"aaa", 3, b"gzz", 4);
+
+        let cache = TableCache::new("db", opts.clone(), share(Cache::new(128)), 100);
+        let mut v = Version::new(share(cache), Rc::new(Box::new(DefaultCmp)));
+        // Deliberately store file_m_z first, file_a_g second — not key-sorted.
+        v.files[0] = vec![file_m_z, file_a_g];
+
+        // Range [bbb, ccc] overlaps file_a_g (aaa–gzz) but NOT file_m_z (maa–zzz).
+        assert!(
+            v.overlap_in_level(0, b"bbb", b"ccc"),
+            "level-0 overlap check must find overlap even when files are not key-sorted"
         );
     }
 }
