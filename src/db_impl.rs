@@ -268,7 +268,15 @@ impl DB {
             }
 
             batch.set_contents(&scratch);
-            batch.insert_into_memtable(batch.sequence(), &mut mem);
+            if let Err(e) = batch.insert_into_memtable(batch.sequence(), &mut mem) {
+                log!(
+                    self.opt.log,
+                    "Skipping corrupted batch in log {:06}: {}",
+                    log_num,
+                    e
+                );
+                continue;
+            }
 
             let last_seq = batch.sequence() + batch.count() as u64 - 1;
             if last_seq > max_seq {
@@ -410,7 +418,7 @@ impl DB {
         let log = self.log.as_mut().unwrap();
         let next = self.vset.borrow().last_seq + 1;
 
-        batch.insert_into_memtable(next, &mut self.mem);
+        batch.insert_into_memtable(next, &mut self.mem)?;
         log.add_record(&batch.encode(next))?;
         if sync {
             log.flush()?;

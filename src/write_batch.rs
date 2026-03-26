@@ -1,3 +1,4 @@
+use crate::error::{err, Result, StatusCode};
 use crate::integer_encoding::{FixedInt, VarInt, VarIntWriter};
 use crate::key_types::ValueType;
 use crate::memtable::MemTable;
@@ -90,17 +91,23 @@ impl WriteBatch {
         WriteBatchIter {
             batch: self,
             ix: HEADER_SIZE,
+            corrupted: false,
         }
     }
 
-    pub fn insert_into_memtable(&self, mut seq: SequenceNumber, mt: &mut MemTable) {
-        for (k, v) in self.iter() {
+    pub fn insert_into_memtable(&self, mut seq: SequenceNumber, mt: &mut MemTable) -> Result<()> {
+        let mut iter = self.iter();
+        while let Some((k, v)) = iter.next() {
             match v {
                 Some(v_) => mt.add(seq, ValueType::TypeValue, k, v_),
                 None => mt.add(seq, ValueType::TypeDeletion, k, b""),
             }
             seq += 1;
         }
+        if iter.corrupted {
+            return err(StatusCode::Corruption, "corrupted write batch");
+        }
+        Ok(())
     }
 
     pub fn encode(mut self, seq: SequenceNumber) -> Vec<u8> {
@@ -118,6 +125,7 @@ impl Default for WriteBatch {
 pub struct WriteBatchIter<'a> {
     batch: &'a WriteBatch,
     ix: usize,
+    corrupted: bool,
 }
 
 /// The iterator also plays the role of the decoder.
@@ -133,12 +141,20 @@ impl<'a> Iterator for WriteBatchIter<'a> {
 
         let (klen, l) = usize::decode_var(&self.batch.entries[self.ix..])?;
         self.ix += l;
+        if self.ix + klen > self.batch.entries.len() {
+            self.corrupted = true;
+            return None;
+        }
         let k = &self.batch.entries[self.ix..self.ix + klen];
         self.ix += klen;
 
         if tag == ValueType::TypeValue as u8 {
             let (vlen, m) = usize::decode_var(&self.batch.entries[self.ix..])?;
             self.ix += m;
+            if self.ix + vlen > self.batch.entries.len() {
+                self.corrupted = true;
+                return None;
+            }
             let v = &self.batch.entries[self.ix..self.ix + vlen];
             self.ix += vlen;
 
@@ -152,7 +168,9 @@ impl<'a> Iterator for WriteBatchIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmp::DefaultCmp;
     use std::iter::Iterator;
+    use std::rc::Rc;
 
     #[test]
     fn test_write_batch() {
@@ -192,5 +210,40 @@ mod tests {
 
         assert_eq!(i, 5);
         assert_eq!(b.encode(1).len(), 49);
+    }
+
+    #[test]
+    fn test_write_batch_truncated() {
+        let mut b = WriteBatch::new();
+        b.put(b"abc", b"def");
+        b.put(b"123", b"456");
+
+        // Truncate the entries to simulate corruption (partial write)
+        b.entries.truncate(b.entries.len() - 2);
+
+        let mut mt = crate::memtable::MemTable::new(Rc::new(Box::new(DefaultCmp)));
+        let result = b.insert_into_memtable(1, &mut mt);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, StatusCode::Corruption);
+    }
+
+    #[test]
+    fn test_write_batch_oversized_varint() {
+        let mut b = WriteBatch::new();
+        b.put(b"abc", b"def");
+
+        // Overwrite the value length varint with a large value.
+        // The entry layout after the header is: [tag=1, klen=3, "abc", vlen=3, "def"]
+        // Find the vlen byte and replace it with a large varint.
+        // tag(1) + klen_varint(1) + "abc"(3) + vlen_varint(1) + "def"(3) = 9 bytes after header
+        // vlen is at offset HEADER_SIZE + 1 + 1 + 3 = HEADER_SIZE + 5
+        let vlen_offset = HEADER_SIZE + 5;
+        // Replace vlen with 200 (larger than remaining data)
+        b.entries[vlen_offset] = 200;
+
+        let mut mt = crate::memtable::MemTable::new(Rc::new(Box::new(DefaultCmp)));
+        let result = b.insert_into_memtable(1, &mut mt);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, StatusCode::Corruption);
     }
 }
