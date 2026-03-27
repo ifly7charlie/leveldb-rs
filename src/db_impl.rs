@@ -706,6 +706,7 @@ impl DB {
             if let Err(e) = self.do_compaction_work(&mut state) {
                 state.cleanup(self.opt.env.as_ref().as_ref(), &self.path);
                 log!(self.opt.log, "Compaction work failed: {}", e);
+                return Err(e);
             }
             self.install_compaction_results(state)?;
             log!(
