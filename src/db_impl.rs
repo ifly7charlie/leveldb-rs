@@ -631,12 +631,12 @@ impl DB {
         // Compact memtable.
         self.make_room_for_write(true)?;
 
-        let mut ifrom = LookupKey::new(from, MAX_SEQUENCE_NUMBER)
-            .internal_key()
-            .to_vec();
         let iend = LookupKey::new_full(to, 0, ValueType::TypeDeletion);
 
         for l in 0..max_level + 1 {
+            let mut ifrom = LookupKey::new(from, MAX_SEQUENCE_NUMBER)
+                .internal_key()
+                .to_vec();
             loop {
                 let c_ = self
                     .vset
@@ -1803,6 +1803,91 @@ mod tests {
             );
             assert_eq!(None, db.get_at(&ss, b"xx2").unwrap());
         }
+    }
+
+    #[test]
+    fn test_compact_range_covers_all_levels() {
+        // Regression test: compact_range must reset its key cursor (ifrom)
+        // at each level. Without the reset, compacting L1 advances ifrom
+        // past L2 files, causing them to be skipped.
+        //
+        // Manually construct a DB with:
+        //   L1: one file with keys mmm-zzz (late range)
+        //   L2: one file with keys aaa-bbb (early range, BEFORE L1)
+        //
+        // compact_range(a, z):
+        //   L0 loop: nothing. ifrom stays at "a".
+        //   L1 loop: compacts mmm-zzz file → L2. ifrom advances to "zzz".
+        //   L2 loop: with bug, starts from "zzz" → aaa-bbb file is skipped.
+        //            with fix, starts from "a" → aaa-bbb file is found.
+        use crate::version::testutil::write_table;
+
+        let name = "db";
+        let mut opt = options::for_test();
+        opt.reuse_logs = false;
+        opt.reuse_manifest = false;
+
+        // Create table files on disk.
+        let env = opt.env.clone();
+        let t1 = write_table(
+            env.as_ref().as_ref(),
+            &[
+                (b"mmm", b"v1", ValueType::TypeValue),
+                (b"nnn", b"v2", ValueType::TypeValue),
+                (b"zzz", b"v3", ValueType::TypeValue),
+            ],
+            10,
+            1,
+        );
+        let t2 = write_table(
+            env.as_ref().as_ref(),
+            &[
+                (b"aaa", b"v1", ValueType::TypeValue),
+                (b"bbb", b"v2", ValueType::TypeValue),
+            ],
+            1,
+            2,
+        );
+
+        // Write MANIFEST with t1 at L1 and t2 at L2.
+        let mut ve = VersionEdit::new();
+        ve.set_comparator_name(opt.cmp.id());
+        ve.set_log_num(0);
+        ve.set_next_file(10);
+        ve.set_last_seq(20);
+        ve.add_file(1, t1.borrow().clone());
+        ve.add_file(2, t2.borrow().clone());
+
+        let manifest = manifest_file_name(name, 9);
+        let mf = opt.env.open_writable_file(Path::new(&manifest)).unwrap();
+        let mut lw = LogWriter::new(mf);
+        lw.add_record(&ve.encode()).unwrap();
+        lw.flush().unwrap();
+        set_current_file(opt.env.as_ref().as_ref(), name, 9).unwrap();
+
+        let mut db = DB::open(name, opt).unwrap();
+
+        // Verify setup: L1 has 1 file, L2 has 1 file.
+        {
+            let v = db.current();
+            let v = v.borrow();
+            assert_eq!(v.files[1].len(), 1, "L1 should have 1 file");
+            assert_eq!(v.files[2].len(), 1, "L2 should have 1 file");
+        }
+
+        db.compact_range(b"a", b"z").unwrap();
+
+        let v = db.current();
+        let v = v.borrow();
+
+        // With the bug: L1 compaction advances ifrom to "zzz", L2 loop starts
+        // from "zzz" and skips the aaa-bbb file. L2 retains 1 file.
+        // With the fix: L2 loop starts from "a", finds aaa-bbb, compacts it.
+        assert_eq!(
+            v.files[2].len(),
+            0,
+            "L2 aaa-bbb file should have been compacted but was skipped"
+        );
     }
 
     #[test]
