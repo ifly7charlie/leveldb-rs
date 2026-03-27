@@ -1074,7 +1074,7 @@ pub fn build_table<I: LdbIterator, P: AsRef<Path>>(
     Ok(md)
 }
 
-fn log_file_name(db: &Path, num: FileNum) -> PathBuf {
+pub(crate) fn log_file_name(db: &Path, num: FileNum) -> PathBuf {
     db.join(format!("{:06}.log", num))
 }
 

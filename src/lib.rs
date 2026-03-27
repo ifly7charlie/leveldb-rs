@@ -88,6 +88,7 @@ mod write_batch;
 
 mod db_impl;
 mod db_iter;
+mod repair;
 
 pub mod compressor;
 pub mod env;
@@ -110,4 +111,5 @@ pub use mem_env::MemEnv;
 pub use options::{in_memory, CompressorList, Options};
 pub use skipmap::SkipMap;
 pub use types::LdbIterator;
+pub use repair::repair_db;
 pub use write_batch::WriteBatch;
