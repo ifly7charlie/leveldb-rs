@@ -601,22 +601,25 @@ impl DB {
     }
 
     /// maybe_do_compaction starts a blocking compaction if it makes sense.
+    /// After flushing the memtable, it runs up to 2 compactions to handle
+    /// the common L0→L1→L2 cascade without blocking writes on a full
+    /// compaction through all levels.
     fn maybe_do_compaction(&mut self) -> Result<()> {
         if self.imm.is_some() {
             self.compact_memtable()?;
         }
-        // Issue #34 PR #36: after compacting a memtable into an L0 file, it is possible that the
-        // L0 files need to be merged and promoted.
-        if self.vset.borrow().needs_compaction() {
+        for _ in 0..2 {
+            if !self.vset.borrow().needs_compaction() {
+                break;
+            }
             let c = self.vset.borrow_mut().pick_compaction();
             if let Some(c) = c {
-                self.start_compaction(c)
+                self.start_compaction(c)?;
             } else {
-                Ok(())
+                break;
             }
-        } else {
-            Ok(())
         }
+        Ok(())
     }
 
     /// compact_range triggers an immediate compaction on the specified key range. Repeatedly
