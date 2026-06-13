@@ -666,6 +666,19 @@ impl DB {
         Ok(())
     }
 
+    /// Per-level (level, file count, total bytes) for every non-empty level in
+    /// the current version. Diagnostic helper: unlike level_summary() it omits
+    /// the per-file detail, so it stays cheap to log even with tens of thousands
+    /// of SST files.
+    pub fn level_file_sizes(&self) -> Vec<(usize, usize, usize)> {
+        let v = self.vset.borrow().current();
+        let v = v.borrow();
+        (0..NUM_LEVELS)
+            .map(|level| (level, v.num_level_files(level), v.num_level_bytes(level)))
+            .filter(|&(_, files, _)| files > 0)
+            .collect()
+    }
+
     /// start_compaction dispatches the different kinds of compactions depending on the current
     /// state of the database.
     fn start_compaction(&mut self, mut compaction: Compaction) -> Result<()> {
