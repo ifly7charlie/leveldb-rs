@@ -152,6 +152,20 @@ impl<T> LRUList<T> {
     }
 }
 
+impl<T> Drop for LRUList<T> {
+    /// Drop nodes iteratively. `next` is an owning `Box<LRUNode>`, so the
+    /// derived drop recurses one stack frame per node and overflows the stack
+    /// for large caches (a 256MB block cache at a 4KB block size holds ~65k
+    /// nodes - far deeper than a worker thread's stack). The `prev` pointers
+    /// are non-owning raw pointers and need no cleanup.
+    fn drop(&mut self) {
+        let mut node = self.head.next.take();
+        while let Some(mut n) = node {
+            node = n.next.take();
+        }
+    }
+}
+
 pub type CacheKey = [u8; 16];
 pub type CacheID = u64;
 type CacheEntry<T> = (T, LRUHandle<CacheKey>);
@@ -403,5 +417,49 @@ mod tests {
         assert_eq!(lru.remove_last(), Some(3));
         assert_eq!(lru.remove_last(), None);
         assert_eq!(lru.remove_last(), None);
+    }
+
+    // Regression: a large LRU list must drop without overflowing the stack.
+    // LRUNode.next is an owning Box, so a derived/recursive Drop recurses one
+    // frame per node - a 256MB block cache holds ~65k nodes and used to SIGSEGV
+    // on teardown. Both tests build a long list and drop it on a thread with a
+    // deliberately small (256KB) stack, so any regression to recursive drop
+    // aborts the test binary deterministically instead of depending on the
+    // default stack size. The fix is the explicit iterative Drop for LRUList.
+    #[test]
+    fn test_lrulist_large_drop_no_stack_overflow() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut lru = LRUList::<usize>::new();
+                for i in 0..100_000 {
+                    lru.insert(i);
+                }
+                assert_eq!(lru.count(), 100_000);
+                drop(lru);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_cache_large_capacity_drop_no_stack_overflow() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                // Mirror a large block cache: many distinct keys held at once.
+                let mut cache = Cache::<usize>::new(100_000);
+                for i in 0..100_000usize {
+                    let mut key = [0u8; 16];
+                    key[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    cache.insert(&key, i);
+                }
+                assert_eq!(cache.count(), 100_000);
+                drop(cache);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
