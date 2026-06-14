@@ -328,6 +328,15 @@ impl LdbIterator for TableIterator {
                 if let Ok(()) = self.load_block(&handle) {
                     // current_block is always set if load_block() returned Ok.
                     self.current_block.as_mut().unwrap().seek(to);
+                    // `to` can fall in the gap after this block's last key (the
+                    // index only guarantees the block's separator >= `to`), so
+                    // the block seek finds nothing. Drop it and advance to the
+                    // next block's first entry; otherwise seek() falsely reports
+                    // "no key >= to".
+                    if !self.current_block.as_ref().unwrap().valid() {
+                        self.current_block = None;
+                        self.advance();
+                    }
                     return;
                 }
             }
@@ -690,6 +699,35 @@ mod tests {
         assert!(!iter.valid());
         iter.seek(b"bbb");
         assert!(iter.valid());
+    }
+
+    #[test]
+    fn test_table_iterator_seek_into_block_gap() {
+        // Regression: seeking to a key that falls in the gap after a block's
+        // last key ("bcd") but at/before that block's index separator must land
+        // on the next block's first key ("bsr"), not invalidate the iterator.
+        // The faulty version returned an invalid iterator here, which made a
+        // level iterator drop the block, hiding tombstones and resurrecting
+        // deleted keys.
+        let (src, size) = build_table(build_data());
+        let bc = share(Cache::new(128));
+        let table = Table::new_raw(options::for_test(), bc, wrap_buffer(src), size).unwrap();
+        let mut iter = table.iter();
+
+        for gap in [&b"bce"[..], &b"bcz"[..]] {
+            iter.seek(gap);
+            assert!(
+                iter.valid(),
+                "seek({:?}) into inter-block gap invalidated the iterator",
+                String::from_utf8_lossy(gap)
+            );
+            assert_eq!(
+                current_key_val(&iter),
+                Some((b"bsr".to_vec(), b"a00".to_vec())),
+                "seek({:?}) did not land on the next block's first key",
+                String::from_utf8_lossy(gap)
+            );
+        }
     }
 
     #[test]
