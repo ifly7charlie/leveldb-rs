@@ -666,6 +666,72 @@ impl DB {
         Ok(())
     }
 
+    /// Full-range compaction that also cascades into the *bottom* level, so that
+    /// shadowed obsolete key versions and tombstones stranded in the last level
+    /// are reclaimed.
+    ///
+    /// `compact_range` deliberately stops at the highest non-empty level among
+    /// `L1..L(NUM_LEVELS-1)` (see commit aad5397, "Don't consider last level for
+    /// manual compactions"). For an insert-only workload that is correct: nothing
+    /// in the bottom level is ever superseded, so rewriting it would be pure I/O
+    /// for zero reclaim. But for an overwrite/delete-heavy workload the bottom
+    /// level accumulates dead data that only an `L(n-1) -> L(n)` merge can drop,
+    /// and that merge never runs.
+    ///
+    /// This method mirrors C++ LevelDB's `DBImpl::CompactRange`: it scans *all*
+    /// levels including the last for overlapping files to pick `max_level`, then
+    /// compacts every level `0..max_level` (exclusive). Because each level's
+    /// output feeds the next, a single call walks data `L0 -> L1 -> ... -> Ln`,
+    /// and the terminal `L(n-1) -> L(n)` merge drops the bottom level's shadowed
+    /// versions and tombstones (`is_base_level_for` is true there). When the
+    /// bottom level holds nothing worth reclaiming the extra passes are cheap
+    /// no-ops, but it is still markedly more expensive than `compact_range`, so
+    /// callers should gate it behind a bloat trigger rather than run it routinely.
+    pub fn compact_range_full(&mut self, from: &[u8], to: &[u8]) -> Result<()> {
+        let mut max_level = 1;
+        {
+            let v = self.vset.borrow().current();
+            let v = v.borrow();
+            // Unlike compact_range, scan through the last level (1..NUM_LEVELS):
+            // if the bottom level has overlapping files, max_level reaches it and
+            // the loop below runs the merge that reclaims it.
+            for l in 1..NUM_LEVELS {
+                if v.overlap_in_level(l, from, to) {
+                    max_level = l;
+                }
+            }
+        }
+
+        // Compact memtable.
+        self.make_room_for_write(true)?;
+
+        let iend = LookupKey::new_full(to, 0, ValueType::TypeDeletion);
+
+        // Exclusive upper bound: compacting level `l` merges it into `l+1`, so to
+        // reach the L(max_level-1) -> L(max_level) merge we iterate `0..max_level`
+        // (matching C++'s `for (level = 0; level < max_level_with_files; level++)`).
+        for l in 0..max_level {
+            let mut ifrom = LookupKey::new(from, MAX_SEQUENCE_NUMBER)
+                .internal_key()
+                .to_vec();
+            loop {
+                let c_ = self
+                    .vset
+                    .borrow_mut()
+                    .compact_range(l, &ifrom, iend.internal_key());
+                if let Some(c) = c_ {
+                    // Update ifrom to the largest key of the last file in this compaction.
+                    let ix = c.num_inputs(0) - 1;
+                    ifrom.clone_from(&c.input(0, ix).largest.into());
+                    self.start_compaction(c)?;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Per-level (level, file count, total bytes) for every non-empty level in
     /// the current version. Diagnostic helper: unlike level_summary() it omits
     /// the per-file detail, so it stays cheap to log even with tens of thousands
@@ -1912,6 +1978,166 @@ mod tests {
             v.files[2].len(),
             0,
             "L2 aaa-bbb file should have been compacted but was skipped"
+        );
+    }
+
+    #[test]
+    fn test_compact_range_full_reclaims_bottom_level() {
+        // Regression test: compact_range_full must cascade into the bottom level
+        // so a tombstone above it annihilates the shadowed value it deletes.
+        //
+        // Construct:
+        //   L1: tombstone for "kkk" (newer, seq 10)
+        //   L6: value     "kkk"=v (older, seq 1, in the bottom level)
+        //
+        // compact_range (the routine path) only scans L1..L(NUM_LEVELS-1), so it
+        // picks max_level = 1, compacts L1 -> L2, and the tombstone is *retained*
+        // there because L6 still holds "kkk" (not the base level for the key).
+        // The value is never reclaimed.
+        //
+        // compact_range_full scans through L6, picks max_level = 6, and cascades
+        // L1 -> ... -> L6. At the bottom level the tombstone meets the value, is
+        // the base level for the key, and both are dropped -> every level empties.
+        use crate::version::testutil::write_table;
+
+        let bottom = NUM_LEVELS - 1; // L6
+
+        let name = "db";
+        let mut opt = options::for_test();
+        opt.reuse_logs = false;
+        opt.reuse_manifest = false;
+
+        let env = opt.env.clone();
+        // Tombstone for "kkk" with the higher sequence number (newer).
+        let t_tomb = write_table(
+            env.as_ref().as_ref(),
+            &[(b"kkk", b"", ValueType::TypeDeletion)],
+            10,
+            1,
+        );
+        // Value "kkk"=v with the lower sequence number (older), in the bottom level.
+        let t_val = write_table(
+            env.as_ref().as_ref(),
+            &[(b"kkk", b"v", ValueType::TypeValue)],
+            1,
+            2,
+        );
+
+        let mut ve = VersionEdit::new();
+        ve.set_comparator_name(opt.cmp.id());
+        ve.set_log_num(0);
+        ve.set_next_file(10);
+        ve.set_last_seq(20);
+        ve.add_file(1, t_tomb.borrow().clone());
+        ve.add_file(bottom, t_val.borrow().clone());
+
+        let manifest = manifest_file_name(name, 9);
+        let mf = opt.env.open_writable_file(Path::new(&manifest)).unwrap();
+        let mut lw = LogWriter::new(mf);
+        lw.add_record(&ve.encode()).unwrap();
+        lw.flush().unwrap();
+        set_current_file(opt.env.as_ref().as_ref(), name, 9).unwrap();
+
+        let mut db = DB::open(name, opt).unwrap();
+
+        {
+            let v = db.current();
+            let v = v.borrow();
+            assert_eq!(v.files[1].len(), 1, "L1 should start with the tombstone file");
+            assert_eq!(v.files[bottom].len(), 1, "bottom level should start with the value file");
+        }
+
+        db.compact_range_full(b"a", b"z").unwrap();
+
+        // The deleted key must be gone from the read path...
+        assert!(db.get(b"kkk").is_none(), "deleted key must not be visible");
+
+        // ...and physically reclaimed: the tombstone + value drop at the bottom
+        // level, leaving no files at any level.
+        let v = db.current();
+        let v = v.borrow();
+        let total_files: usize = (0..NUM_LEVELS).map(|l| v.files[l].len()).sum();
+        assert_eq!(
+            total_files, 0,
+            "tombstone + shadowed value should be reclaimed; levels still hold {} file(s)",
+            total_files
+        );
+    }
+
+    #[test]
+    fn test_compact_range_leaves_bottom_level_stranded() {
+        // Companion to test_compact_range_full_reclaims_bottom_level: demonstrates
+        // the pre-fix behaviour. The routine compact_range scans only L1..L(N-1),
+        // so with the SAME setup (tombstone at L1, value in the bottom level) it
+        // picks max_level = 1, moves the tombstone L1 -> L2 (kept, because the
+        // bottom level is not the base level for the key), and never reaches the
+        // merge that would drop the value. The value stays stranded in the bottom
+        // level forever - the space leak and ghost-resurrection substrate that
+        // compact_range_full fixes.
+        //
+        // Reads are still correct throughout: the tombstone shadows the value, so
+        // get() returns None. The bug is purely that the dead bytes are never
+        // physically reclaimed.
+        use crate::version::testutil::write_table;
+
+        let bottom = NUM_LEVELS - 1; // L6
+
+        let name = "db";
+        let mut opt = options::for_test();
+        opt.reuse_logs = false;
+        opt.reuse_manifest = false;
+
+        let env = opt.env.clone();
+        let t_tomb = write_table(
+            env.as_ref().as_ref(),
+            &[(b"kkk", b"", ValueType::TypeDeletion)],
+            10,
+            1,
+        );
+        let t_val = write_table(
+            env.as_ref().as_ref(),
+            &[(b"kkk", b"v", ValueType::TypeValue)],
+            1,
+            2,
+        );
+
+        let mut ve = VersionEdit::new();
+        ve.set_comparator_name(opt.cmp.id());
+        ve.set_log_num(0);
+        ve.set_next_file(10);
+        ve.set_last_seq(20);
+        ve.add_file(1, t_tomb.borrow().clone());
+        ve.add_file(bottom, t_val.borrow().clone());
+
+        let manifest = manifest_file_name(name, 9);
+        let mf = opt.env.open_writable_file(Path::new(&manifest)).unwrap();
+        let mut lw = LogWriter::new(mf);
+        lw.add_record(&ve.encode()).unwrap();
+        lw.flush().unwrap();
+        set_current_file(opt.env.as_ref().as_ref(), name, 9).unwrap();
+
+        let mut db = DB::open(name, opt).unwrap();
+
+        // The routine path - the one the rollup used before the fix.
+        db.compact_range(b"a", b"z").unwrap();
+
+        // Read path is still correct: the tombstone shadows the value.
+        assert!(db.get(b"kkk").is_none(), "deleted key must not be visible");
+
+        // ...but the value is NOT reclaimed: it is still sitting in the bottom
+        // level, with the tombstone retained above it. This is the leak.
+        let v = db.current();
+        let v = v.borrow();
+        assert_eq!(
+            v.files[bottom].len(),
+            1,
+            "routine compact_range must leave the value stranded in the bottom level (pre-fix bug)"
+        );
+        let total_files: usize = (0..NUM_LEVELS).map(|l| v.files[l].len()).sum();
+        assert!(
+            total_files >= 2,
+            "tombstone should still be retained above the stranded value; found {} file(s)",
+            total_files
         );
     }
 
