@@ -3,7 +3,7 @@ use crate::env::Env;
 use crate::error::{err, Result, StatusCode};
 use crate::key_types::{parse_internal_key, InternalKey, UserKey};
 use crate::log::{LogReader, LogWriter};
-use crate::merging_iter::MergingIter;
+use crate::merging_iter::HeapMergeIter;
 use crate::options::Options;
 use crate::table_cache::TableCache;
 use crate::types::{
@@ -737,7 +737,12 @@ impl VersionSet {
         }
         assert!(iters.len() <= cap);
         let cmp: Rc<Box<dyn Cmp>> = Rc::new(Box::new(self.cmp.clone()));
-        Box::new(MergingIter::new(cmp, iters))
+        // Forward-only heap merge: compaction drives this strictly forward, and a
+        // wide L0 merge (hundreds/thousands of overlapping tables) would be
+        // O(tables) per key with the linear MergingIter. HeapMergeIter is
+        // O(log tables) per key, which is what keeps a post-repair / heavily
+        // bloated DB compactable in a sane amount of time.
+        Box::new(HeapMergeIter::new(cmp, iters))
     }
 }
 

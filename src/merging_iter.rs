@@ -3,6 +3,7 @@ use crate::types::{current_key_val, Direction, LdbIterator};
 
 use bytes::Bytes;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::rc::Rc;
 
 // Warning: This module is kinda messy. The original implementation is
@@ -188,6 +189,142 @@ impl LdbIterator for MergingIter {
     }
 }
 
+/// One child's current key in the merge heap. Ordered as a *min-heap* under the
+/// comparator, so the heap root is the smallest key across all children (i.e.
+/// the newest version first, matching `MergingIter::find_smallest`).
+struct HeapEntry {
+    key: Bytes,
+    idx: usize,
+    cmp: Rc<Box<dyn Cmp>>,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp.cmp(&self.key, &other.key) == Ordering::Equal
+    }
+}
+impl Eq for HeapEntry {}
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap; reversing the arguments turns it into a
+        // min-heap under `cmp` (smaller key => higher priority => popped first).
+        self.cmp.cmp(&other.key, &self.key)
+    }
+}
+
+/// Forward-only merging iterator backed by a binary heap.
+///
+/// `MergingIter::find_smallest` is O(children) on every `advance()`, which makes
+/// a wide merge (e.g. a compaction over hundreds/thousands of overlapping L0
+/// tables) O(children) per emitted key - pathologically slow. This iterator is
+/// O(log children) per key instead, at the cost of supporting forward iteration
+/// only. It is used solely by `VersionSet::make_input_iterator` (compaction
+/// input), which drives it strictly forward (`seek_to_first` then `advance`);
+/// the read path keeps the bidirectional `MergingIter`. `prev()` panics.
+pub struct HeapMergeIter {
+    iters: Vec<Box<dyn LdbIterator>>,
+    cmp: Rc<Box<dyn Cmp>>,
+    heap: BinaryHeap<HeapEntry>,
+    // Index of the child holding the current entry (the heap root), or None.
+    current: Option<usize>,
+    initialized: bool,
+}
+
+impl HeapMergeIter {
+    pub fn new(cmp: Rc<Box<dyn Cmp>>, iters: Vec<Box<dyn LdbIterator>>) -> HeapMergeIter {
+        HeapMergeIter {
+            iters,
+            cmp,
+            heap: BinaryHeap::new(),
+            current: None,
+            initialized: false,
+        }
+    }
+
+    /// Push child `idx`'s current key onto the heap if it is still valid.
+    fn push_idx(&mut self, idx: usize) {
+        if self.iters[idx].valid() {
+            if let Some((k, _)) = self.iters[idx].current() {
+                self.heap.push(HeapEntry { key: k, idx, cmp: self.cmp.clone() });
+            }
+        }
+    }
+
+    /// Position every child at its first entry and (re)build the heap.
+    fn init(&mut self) {
+        self.heap.clear();
+        for i in 0..self.iters.len() {
+            self.iters[i].reset();
+            self.iters[i].advance();
+            if self.iters[i].valid() {
+                self.push_idx(i);
+            } else {
+                self.iters[i].reset();
+            }
+        }
+        self.initialized = true;
+        self.current = self.heap.peek().map(|e| e.idx);
+    }
+}
+
+impl LdbIterator for HeapMergeIter {
+    fn advance(&mut self) -> bool {
+        if !self.initialized {
+            self.init();
+            return self.valid();
+        }
+        // Emit the next key: pop the current smallest, advance that child, and
+        // re-insert its new position. The new root is the next smallest key.
+        if let Some(top) = self.heap.pop() {
+            let idx = top.idx;
+            self.iters[idx].advance();
+            self.push_idx(idx);
+        }
+        self.current = self.heap.peek().map(|e| e.idx);
+        self.valid()
+    }
+    fn valid(&self) -> bool {
+        match self.current {
+            Some(ix) => self.iters[ix].valid(),
+            None => false,
+        }
+    }
+    fn current(&self) -> Option<(Bytes, Bytes)> {
+        match self.current {
+            Some(ix) => self.iters[ix].current(),
+            None => None,
+        }
+    }
+    fn seek(&mut self, key: &[u8]) {
+        self.heap.clear();
+        for i in 0..self.iters.len() {
+            self.iters[i].seek(key);
+            if self.iters[i].valid() {
+                self.push_idx(i);
+            }
+        }
+        self.initialized = true;
+        self.current = self.heap.peek().map(|e| e.idx);
+    }
+    fn reset(&mut self) {
+        self.heap.clear();
+        for i in 0..self.iters.len() {
+            self.iters[i].reset();
+        }
+        self.current = None;
+        self.initialized = false;
+    }
+    fn prev(&mut self) -> bool {
+        // Forward-only: only used for compaction input, which never goes back.
+        panic!("HeapMergeIter is forward-only and does not support prev()");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +491,81 @@ mod tests {
         assert_eq!(
             current_key_val(&iter),
             Some((b("aba").to_vec(), val.to_vec()))
+        );
+    }
+
+    #[test]
+    fn test_heap_merge_forward_matches_merging_iter() {
+        // HeapMergeIter must emit the exact same forward sequence as the linear
+        // MergingIter for the same inputs - it changes only the per-step cost
+        // (O(log n) vs O(n)), not the order.
+        let val = b"def";
+        let make = || -> Vec<Box<dyn LdbIterator>> {
+            vec![
+                Box::new(TestLdbIter::new(vec![
+                    (b("aba"), val),
+                    (b("abc"), val),
+                    (b("abe"), val),
+                ])),
+                Box::new(TestLdbIter::new(vec![(b("abb"), val), (b("abd"), val)])),
+                Box::new(TestLdbIter::new(vec![
+                    (b("aa0"), val),
+                    (b("abf"), val),
+                    (b("abz"), val),
+                ])),
+            ]
+        };
+        let cmp: Rc<Box<dyn Cmp>> = Rc::new(Box::new(DefaultCmp));
+
+        let mut linear = MergingIter::new(cmp.clone(), make());
+        let mut heaped = HeapMergeIter::new(cmp.clone(), make());
+
+        let linear_seq: Vec<_> = LdbIteratorIter::wrap(&mut linear).collect();
+        let heaped_seq: Vec<_> = LdbIteratorIter::wrap(&mut heaped).collect();
+
+        assert_eq!(linear_seq, heaped_seq, "heap merge order must match linear merge");
+
+        let expected = ["aa0", "aba", "abb", "abc", "abd", "abe", "abf", "abz"];
+        assert_eq!(heaped_seq.len(), expected.len());
+        for (i, (k, _)) in heaped_seq.iter().enumerate() {
+            assert_eq!(k.as_slice(), expected[i].as_bytes());
+        }
+    }
+
+    #[test]
+    fn test_heap_merge_empty() {
+        let cmp: Rc<Box<dyn Cmp>> = Rc::new(Box::new(DefaultCmp));
+        let mut it = HeapMergeIter::new(cmp, vec![]);
+        assert_eq!(0, LdbIteratorIter::wrap(&mut it).count());
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn test_heap_merge_seek_to_first() {
+        let val = b"def";
+        let cmp: Rc<Box<dyn Cmp>> = Rc::new(Box::new(DefaultCmp));
+        let mut it = HeapMergeIter::new(
+            cmp,
+            vec![
+                Box::new(TestLdbIter::new(vec![(b("abc"), val), (b("abe"), val)])),
+                Box::new(TestLdbIter::new(vec![(b("aba"), val), (b("abd"), val)])),
+            ],
+        );
+        it.seek_to_first();
+        // Lands on the smallest key across both children, including the first entry.
+        assert_eq!(current_key_val(&it), Some((b("aba").to_vec(), val.to_vec())));
+        let mut got = vec![current_key_val(&it).unwrap().0];
+        while it.advance() {
+            got.push(current_key_val(&it).unwrap().0);
+        }
+        assert_eq!(
+            got,
+            vec![
+                b("aba").to_vec(),
+                b("abc").to_vec(),
+                b("abd").to_vec(),
+                b("abe").to_vec(),
+            ]
         );
     }
 }
