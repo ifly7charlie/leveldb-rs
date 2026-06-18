@@ -2065,6 +2065,87 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_range_full_reclaims_after_snapshot_released() {
+        // Regression test for snapshot-list bugs that prevented tombstone dropping
+        // in the server (but not in compactdb, which opens a fresh DB).
+        //
+        // Bug 1: empty() checked a stale `oldest` field rather than map.is_empty(),
+        //        so once any snapshot had ever been created, empty() returned false forever.
+        // Bug 2: oldest() folded over map keys (SnapshotHandle) instead of values
+        //        (SequenceNumber), returning a tiny handle value instead of the actual seq.
+        //
+        // Combined: after the first iterator was created and dropped, compact_range_full
+        // set smallest_seq=0 (oldest() over empty map → 0), making the tombstone-drop
+        // condition `seq <= 0` permanently false.  Tombstones were never reclaimed.
+        //
+        // This test replicates the server scenario: create an iterator (triggering a
+        // snapshot), drop it, then run compact_range_full. The tombstone+value must still
+        // be physically reclaimed.
+        use crate::version::testutil::write_table;
+
+        let bottom = NUM_LEVELS - 1;
+
+        let name = "db";
+        let mut opt = options::for_test();
+        opt.reuse_logs = false;
+        opt.reuse_manifest = false;
+
+        let env = opt.env.clone();
+        let t_tomb = write_table(
+            env.as_ref().as_ref(),
+            &[(b"kkk", b"", ValueType::TypeDeletion)],
+            10,
+            1,
+        );
+        let t_val = write_table(
+            env.as_ref().as_ref(),
+            &[(b"kkk", b"v", ValueType::TypeValue)],
+            1,
+            2,
+        );
+
+        let mut ve = VersionEdit::new();
+        ve.set_comparator_name(opt.cmp.id());
+        ve.set_log_num(0);
+        ve.set_next_file(10);
+        ve.set_last_seq(20);
+        ve.add_file(1, t_tomb.borrow().clone());
+        ve.add_file(bottom, t_val.borrow().clone());
+
+        let manifest = manifest_file_name(name, 9);
+        let mf = opt.env.open_writable_file(Path::new(&manifest)).unwrap();
+        let mut lw = LogWriter::new(mf);
+        lw.add_record(&ve.encode()).unwrap();
+        lw.flush().unwrap();
+        set_current_file(opt.env.as_ref().as_ref(), name, 9).unwrap();
+
+        let mut db = DB::open(name, opt).unwrap();
+
+        // Simulate what the server does before compaction: iterate (creates a snapshot),
+        // then drop the iterator (releases the snapshot). After this, the snapshot list
+        // map is empty but the stale `oldest` field would leave empty() returning false.
+        {
+            let mut iter = db.new_iter().unwrap();
+            iter.seek(b"a");
+            // iterator dropped here, snapshot released
+        }
+
+        db.compact_range_full(b"a", b"z").unwrap();
+
+        assert!(db.get(b"kkk").is_none(), "deleted key must not be visible after compaction");
+
+        let v = db.current();
+        let v = v.borrow();
+        let total_files: usize = (0..NUM_LEVELS).map(|l| v.files[l].len()).sum();
+        assert_eq!(
+            total_files, 0,
+            "tombstone + shadowed value should be reclaimed even after a snapshot was released; \
+             levels still hold {} file(s)",
+            total_files
+        );
+    }
+
+    #[test]
     fn test_compact_range_leaves_bottom_level_stranded() {
         // Companion to test_compact_range_full_reclaims_bottom_level: demonstrates
         // the pre-fix behaviour. The routine compact_range scans only L1..L(N-1),
