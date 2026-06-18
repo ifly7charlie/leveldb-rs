@@ -86,7 +86,7 @@ impl SnapshotList {
             .iter()
             .fold(
                 MAX_SEQUENCE_NUMBER,
-                |s, (seq, _)| if *seq < s { *seq } else { s },
+                |s, (_, seq)| if *seq < s { *seq } else { s },
             );
         if oldest == MAX_SEQUENCE_NUMBER {
             0
@@ -102,11 +102,11 @@ impl SnapshotList {
             .borrow()
             .map
             .iter()
-            .fold(0, |s, (seq, _)| if *seq > s { *seq } else { s })
+            .fold(0, |s, (_, seq)| if *seq > s { *seq } else { s })
     }
 
     pub fn empty(&self) -> bool {
-        self.inner.borrow().oldest == 0
+        self.inner.borrow().map.is_empty()
     }
 }
 
@@ -147,5 +147,38 @@ mod tests {
             assert_eq!(l.oldest(), 1);
         }
         assert_eq!(l.oldest(), 0);
+    }
+
+    // The original test above accidentally passes even with the bugs because seq==handle
+    // (seq=1 for handle=1, seq=2 for handle=2, etc.). These tests use non-sequential
+    // sequence numbers to catch the real bugs.
+
+    #[test]
+    fn test_oldest_returns_minimum_sequence_not_handle() {
+        // Bug: oldest() iterated over map keys (SnapshotHandle) instead of values
+        // (SequenceNumber). With seq != handle, it returned the wrong value.
+        let mut l = SnapshotList::new();
+        let _a = l.new_snapshot(1000); // handle=1, seq=1000
+        let _b = l.new_snapshot(500);  // handle=2, seq=500  ← lowest seq, higher handle
+        let _c = l.new_snapshot(2000); // handle=3, seq=2000 ← highest seq
+        assert_eq!(l.oldest(), 500,  "oldest() must return minimum sequence, not minimum handle");
+        assert_eq!(l.newest(), 2000, "newest() must return maximum sequence, not maximum handle");
+    }
+
+    #[test]
+    fn test_empty_returns_true_after_all_snapshots_dropped() {
+        // Bug: empty() checked the `oldest` struct field, which is set on first
+        // snapshot creation and never reset to 0 when snapshots are deleted.
+        // After dropping all snapshots, empty() incorrectly returned false.
+        let mut l = SnapshotList::new();
+        assert!(l.empty());
+        {
+            let _snap = l.new_snapshot(999);
+            assert!(!l.empty());
+        } // _snap dropped here
+        assert!(l.empty(), "empty() must return true after all snapshots are released");
+        // oldest()/newest() must also behave sensibly on an empty list.
+        assert_eq!(l.oldest(), 0, "oldest() on empty list must return 0");
+        assert_eq!(l.newest(), 0, "newest() on empty list must return 0");
     }
 }
