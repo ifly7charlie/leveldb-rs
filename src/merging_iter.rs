@@ -22,12 +22,12 @@ pub struct MergingIter {
     iters: Vec<Box<dyn LdbIterator>>,
     current: Option<usize>,
     direction: Direction,
-    cmp: Rc<Box<dyn Cmp>>,
+    cmp: Rc<dyn Cmp>,
 }
 
 impl MergingIter {
     /// Construct a new merging iterator.
-    pub fn new(cmp: Rc<Box<dyn Cmp>>, iters: Vec<Box<dyn LdbIterator>>) -> MergingIter {
+    pub fn new(cmp: Rc<dyn Cmp>, iters: Vec<Box<dyn LdbIterator>>) -> MergingIter {
         MergingIter {
             iters,
             current: None,
@@ -195,7 +195,7 @@ impl LdbIterator for MergingIter {
 struct HeapEntry {
     key: Bytes,
     idx: usize,
-    cmp: Rc<Box<dyn Cmp>>,
+    cmp: Rc<dyn Cmp>,
 }
 
 impl PartialEq for HeapEntry {
@@ -228,7 +228,7 @@ impl Ord for HeapEntry {
 /// the read path keeps the bidirectional `MergingIter`. `prev()` panics.
 pub struct HeapMergeIter {
     iters: Vec<Box<dyn LdbIterator>>,
-    cmp: Rc<Box<dyn Cmp>>,
+    cmp: Rc<dyn Cmp>,
     heap: BinaryHeap<HeapEntry>,
     // Index of the child holding the current entry (the heap root), or None.
     current: Option<usize>,
@@ -236,7 +236,7 @@ pub struct HeapMergeIter {
 }
 
 impl HeapMergeIter {
-    pub fn new(cmp: Rc<Box<dyn Cmp>>, iters: Vec<Box<dyn LdbIterator>>) -> HeapMergeIter {
+    pub fn new(cmp: Rc<dyn Cmp>, iters: Vec<Box<dyn LdbIterator>>) -> HeapMergeIter {
         HeapMergeIter {
             iters,
             cmp,
@@ -340,7 +340,7 @@ mod tests {
         let iter = skm.iter();
         let mut iter2 = skm.iter();
 
-        let mut miter = MergingIter::new(Rc::new(Box::new(DefaultCmp)), vec![Box::new(iter)]);
+        let mut miter = MergingIter::new(Rc::new(DefaultCmp),vec![Box::new(iter)]);
 
         while let Some((k, v)) = miter.next() {
             if let Some((k2, v2)) = iter2.next() {
@@ -359,7 +359,7 @@ mod tests {
         let iter2 = skm.iter();
 
         let mut miter = MergingIter::new(
-            Rc::new(Box::new(DefaultCmp)),
+            Rc::new(DefaultCmp),
             vec![Box::new(iter), Box::new(iter2)],
         );
 
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_merging_zero() {
-        let mut miter = MergingIter::new(Rc::new(Box::new(DefaultCmp)), vec![]);
+        let mut miter = MergingIter::new(Rc::new(DefaultCmp),vec![]);
         assert_eq!(0, LdbIteratorIter::wrap(&mut miter).count());
     }
 
@@ -385,7 +385,7 @@ mod tests {
         let iter = TestLdbIter::new(vec![(b("aba"), val), (b("abc"), val)]);
         let iter2 = TestLdbIter::new(vec![(b("abb"), val), (b("abd"), val)]);
         let miter = MergingIter::new(
-            Rc::new(Box::new(DefaultCmp)),
+            Rc::new(DefaultCmp),
             vec![Box::new(iter), Box::new(iter2)],
         );
         test_iterator_properties(miter);
@@ -398,7 +398,7 @@ mod tests {
         let iter2 = TestLdbIter::new(vec![(b("abb"), val), (b("abd"), val)]);
 
         let mut miter = MergingIter::new(
-            Rc::new(Box::new(DefaultCmp)),
+            Rc::new(DefaultCmp),
             vec![Box::new(iter), Box::new(iter2)],
         );
 
@@ -446,7 +446,7 @@ mod tests {
         let expected = [b("aba"), b("abb"), b("abc"), b("abd"), b("abe")];
 
         let mut iter = MergingIter::new(
-            Rc::new(Box::new(DefaultCmp)),
+            Rc::new(DefaultCmp),
             vec![Box::new(it1), Box::new(it2)],
         );
 
@@ -463,7 +463,7 @@ mod tests {
         let it2 = TestLdbIter::new(vec![(b("abb"), val), (b("abd"), val)]);
 
         let mut iter = MergingIter::new(
-            Rc::new(Box::new(DefaultCmp)),
+            Rc::new(DefaultCmp),
             vec![Box::new(it1), Box::new(it2)],
         );
 
@@ -515,7 +515,7 @@ mod tests {
                 ])),
             ]
         };
-        let cmp: Rc<Box<dyn Cmp>> = Rc::new(Box::new(DefaultCmp));
+        let cmp: Rc<dyn Cmp> = Rc::new(DefaultCmp);
 
         let mut linear = MergingIter::new(cmp.clone(), make());
         let mut heaped = HeapMergeIter::new(cmp.clone(), make());
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_heap_merge_empty() {
-        let cmp: Rc<Box<dyn Cmp>> = Rc::new(Box::new(DefaultCmp));
+        let cmp: Rc<dyn Cmp> = Rc::new(DefaultCmp);
         let mut it = HeapMergeIter::new(cmp, vec![]);
         assert_eq!(0, LdbIteratorIter::wrap(&mut it).count());
         assert!(!it.valid());
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn test_heap_merge_seek_to_first() {
         let val = b"def";
-        let cmp: Rc<Box<dyn Cmp>> = Rc::new(Box::new(DefaultCmp));
+        let cmp: Rc<dyn Cmp> = Rc::new(DefaultCmp);
         let mut it = HeapMergeIter::new(
             cmp,
             vec![

@@ -221,7 +221,7 @@ mod tests {
         // Truncate the entries to simulate corruption (partial write)
         b.entries.truncate(b.entries.len() - 2);
 
-        let mut mt = crate::memtable::MemTable::new(Rc::new(Box::new(DefaultCmp)));
+        let mut mt = crate::memtable::MemTable::new(Rc::new(DefaultCmp));
         let result = b.insert_into_memtable(1, &mut mt);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, StatusCode::Corruption);
@@ -241,7 +241,7 @@ mod tests {
         // Replace vlen with 200 (larger than remaining data)
         b.entries[vlen_offset] = 200;
 
-        let mut mt = crate::memtable::MemTable::new(Rc::new(Box::new(DefaultCmp)));
+        let mut mt = crate::memtable::MemTable::new(Rc::new(DefaultCmp));
         let result = b.insert_into_memtable(1, &mut mt);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, StatusCode::Corruption);

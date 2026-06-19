@@ -40,7 +40,7 @@ fn bench_gen_key_val(b: &mut Bencher) {
 fn bench_skipmap_insert(b: &mut Bencher) {
     let mut gen = rand::thread_rng();
 
-    let mut skm = SkipMap::new(Rc::new(Box::new(DefaultCmp)));
+    let mut skm = SkipMap::new(Rc::new(DefaultCmp));
 
     b.iter(|| {
         let (mut k, v) = gen_key_val(&mut gen, 10, 10);
