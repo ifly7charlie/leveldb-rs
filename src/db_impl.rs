@@ -134,7 +134,7 @@ impl DB {
         }
 
         if save_manifest {
-            ve.set_log_num(db.log_num.unwrap_or(0));
+            ve.set_log_num(db.log_num.unwrap_or_else(|| db.vset.borrow().log_num));
             db.vset.borrow_mut().log_and_apply(ve)?;
         }
 
