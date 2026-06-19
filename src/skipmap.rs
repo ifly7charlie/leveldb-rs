@@ -21,6 +21,19 @@ struct Node {
     value: Bytes,
 }
 
+impl Default for Node {
+    fn default() -> Self {
+        let mut s = Vec::new();
+        s.resize(MAX_HEIGHT, None);
+        Node {
+            skips: s,
+            next: None,
+            key: Bytes::new(),
+            value: Bytes::new(),
+        }
+    }
+}
+
 /// Implements the backing store for a `MemTable`. The important methods are `insert()` and
 /// `contains()`; in order to get full key and value for an entry, use a `SkipMapIter` instance,
 /// `seek()` to the key to look up (this is as fast as any lookup in a skip map), and then call
@@ -56,17 +69,9 @@ impl SkipMap {
 
     /// Returns a SkipMap that uses the specified comparator.
     pub fn new(cmp: Rc<dyn Cmp>) -> SkipMap {
-        let mut s = Vec::new();
-        s.resize(MAX_HEIGHT, None);
-
         SkipMap {
             map: Rc::new(RefCell::new(InnerSkipMap {
-                head: Box::new(Node {
-                    skips: s,
-                    next: None,
-                    key: Bytes::new(),
-                    value: Bytes::new(),
-                }),
+                head: Box::new(Node::default()),
                 rand: StdRng::seed_from_u64(0xdeadbeef),
                 len: 0,
                 approx_mem: size_of::<Self>() + MAX_HEIGHT * size_of::<Option<*mut Node>>(),

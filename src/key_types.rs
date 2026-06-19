@@ -88,8 +88,8 @@ impl LookupKey {
 
 /// Parses a tag into (type, sequence number)
 pub fn parse_tag(tag: u64) -> (ValueType, u64) {
-    let seq = tag >> 8;
-    let typ = tag & 0xff;
+    let seq = tag >> 8;    // first 56bit is SequenceNumber
+    let typ = tag & 0xff;  // last   8bit is ValueType
 
     match typ {
         0 => (ValueType::TypeDeletion, seq),

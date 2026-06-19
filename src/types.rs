@@ -120,8 +120,7 @@ pub type FileNum = u64;
 /// Describes a file on disk.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FileMetaData {
-    // default: size / 16384.
-    pub allowed_seeks: usize,
+    pub allowed_seeks: usize,    // default: size / 16384.
     pub num: FileNum,
     pub size: usize,
     // these are in InternalKey format:

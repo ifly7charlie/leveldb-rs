@@ -41,9 +41,8 @@ impl Cmp for DefaultCmp {
             return a.to_vec();
         }
 
-        let min = if a.len() < b.len() { a.len() } else { b.len() };
+        let min = std::cmp::min(a.len(), b.len());
         let mut diff_at = 0;
-
         while diff_at < min && a[diff_at] == b[diff_at] {
             diff_at += 1;
         }
@@ -57,7 +56,6 @@ impl Cmp for DefaultCmp {
                 assert!(self.cmp(&sep, b) == Ordering::Less);
                 return sep;
             }
-
             diff_at += 1;
         }
 
