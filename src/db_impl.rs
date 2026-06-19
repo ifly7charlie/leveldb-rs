@@ -1897,6 +1897,46 @@ mod tests {
     }
 
     #[test]
+    fn test_db_reopen_with_new_manifest_preserves_log_num() {
+        // Regression test for the log_num fix (yuhangle): when reuse_manifest=false,
+        // vset.recover() returns save_manifest=true, which calls log_and_apply with
+        // the edit's log_number. The log_number must be >= vset.log_num or the
+        // assertion in log_and_apply fires. Previously, unwrap_or(0) would supply 0
+        // on the second open (when log_num is the freshly-created log), causing a
+        // panic because 0 < vset.log_num recovered from the manifest.
+        let opt = options::for_test();
+
+        {
+            // First open: fresh DB, write some data.
+            let mut db = DB::open("rmndb", opt.clone()).unwrap();
+            db.put(b"key1", b"val1").unwrap();
+            db.put(b"key2", b"val2").unwrap();
+        }
+
+        {
+            // Second open: reuse_manifest=false forces save_manifest=true, which
+            // calls log_and_apply with the new log's file number. This is the path
+            // where the original unwrap_or(0) bug would panic.
+            let mut opt2 = opt.clone();
+            opt2.reuse_manifest = false;
+            opt2.reuse_logs = false;
+            let mut db = DB::open("rmndb", opt2).unwrap();
+            assert_eq!(Some(b"val1".to_vec()), db.get(b"key1").map(|b| b.to_vec()));
+            assert_eq!(Some(b"val2".to_vec()), db.get(b"key2").map(|b| b.to_vec()));
+            db.put(b"key3", b"val3").unwrap();
+        }
+
+        {
+            // Third open: verify the manifest written in the second open is valid and
+            // the DB recovers correctly with all three keys present.
+            let mut db = DB::open("rmndb", opt).unwrap();
+            assert_eq!(Some(b"val1".to_vec()), db.get(b"key1").map(|b| b.to_vec()));
+            assert_eq!(Some(b"val2".to_vec()), db.get(b"key2").map(|b| b.to_vec()));
+            assert_eq!(Some(b"val3".to_vec()), db.get(b"key3").map(|b| b.to_vec()));
+        }
+    }
+
+    #[test]
     fn test_compact_range_covers_all_levels() {
         // Regression test: compact_range must reset its key cursor (ifrom)
         // at each level. Without the reset, compacting L1 advances ifrom
