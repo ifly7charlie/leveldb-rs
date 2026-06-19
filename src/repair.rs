@@ -49,7 +49,7 @@ pub fn repair_db<P: AsRef<Path>>(dbname: P, opt: Options) -> Result<()> {
     logs.sort();
 
     // 2. Replay log files into new tables.
-    let cmp: Rc<Box<dyn crate::cmp::Cmp>> = opt.cmp.clone();
+    let cmp: Rc<dyn crate::cmp::Cmp> = opt.cmp.clone();
     for &log_num in &logs {
         let filename = log_file_name(dbname, log_num);
         let logfile = match opt.env.open_sequential_file(Path::new(&filename)) {
@@ -152,7 +152,7 @@ pub fn repair_db<P: AsRef<Path>>(dbname: P, opt: Options) -> Result<()> {
     lw.flush()?;
 
     // 5. Update CURRENT to point to the new MANIFEST.
-    set_current_file(opt.env.as_ref().as_ref(), dbname, manifest_num)?;
+    set_current_file(opt.env.as_ref(), dbname, manifest_num)?;
 
     // 6. Delete recovered log files (their data is now in tables).
     for &log_num in &logs {
@@ -219,7 +219,7 @@ mod tests {
 
     fn test_options() -> Options {
         let mut opt = options::for_test();
-        opt.env = Rc::new(Box::new(MemEnv::new()));
+        opt.env = Rc::new(MemEnv::new());
         opt
     }
 

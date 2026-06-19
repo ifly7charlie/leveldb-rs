@@ -21,6 +21,19 @@ struct Node {
     value: Bytes,
 }
 
+impl Default for Node {
+    fn default() -> Self {
+        let mut s = Vec::new();
+        s.resize(MAX_HEIGHT, None);
+        Node {
+            skips: s,
+            next: None,
+            key: Bytes::new(),
+            value: Bytes::new(),
+        }
+    }
+}
+
 /// Implements the backing store for a `MemTable`. The important methods are `insert()` and
 /// `contains()`; in order to get full key and value for an entry, use a `SkipMapIter` instance,
 /// `seek()` to the key to look up (this is as fast as any lookup in a skip map), and then call
@@ -31,7 +44,7 @@ struct InnerSkipMap {
     len: usize,
     // approximation of memory used.
     approx_mem: usize,
-    cmp: Rc<Box<dyn Cmp>>,
+    cmp: Rc<dyn Cmp>,
 }
 
 impl Drop for InnerSkipMap {
@@ -50,23 +63,15 @@ pub struct SkipMap {
 
 impl SkipMap {
     /// Returns a SkipMap that wraps the comparator inside a MemtableKeyCmp.
-    pub fn new_memtable_map(cmp: Rc<Box<dyn Cmp>>) -> SkipMap {
-        SkipMap::new(Rc::new(Box::new(MemtableKeyCmp(cmp))))
+    pub fn new_memtable_map(cmp: Rc<dyn Cmp>) -> SkipMap {
+        SkipMap::new(Rc::new(MemtableKeyCmp(cmp)))
     }
 
     /// Returns a SkipMap that uses the specified comparator.
-    pub fn new(cmp: Rc<Box<dyn Cmp>>) -> SkipMap {
-        let mut s = Vec::new();
-        s.resize(MAX_HEIGHT, None);
-
+    pub fn new(cmp: Rc<dyn Cmp>) -> SkipMap {
         SkipMap {
             map: Rc::new(RefCell::new(InnerSkipMap {
-                head: Box::new(Node {
-                    skips: s,
-                    next: None,
-                    key: Bytes::new(),
-                    value: Bytes::new(),
-                }),
+                head: Box::new(Node::default()),
                 rand: StdRng::seed_from_u64(0xdeadbeef),
                 len: 0,
                 approx_mem: size_of::<Self>() + MAX_HEIGHT * size_of::<Option<*mut Node>>(),
@@ -451,7 +456,7 @@ pub mod tests {
     #[test]
     fn test_empty_skipmap_find_memtable_cmp() {
         // Regression test: Make sure comparator isn't called with empty key.
-        let cmp: Rc<Box<dyn Cmp>> = Rc::new(Box::new(MemtableKeyCmp(options::for_test().cmp)));
+        let cmp: Rc<dyn Cmp> = Rc::new(MemtableKeyCmp(options::for_test().cmp));
         let skm = SkipMap::new(cmp);
 
         let mut it = skm.iter();

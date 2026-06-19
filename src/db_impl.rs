@@ -46,7 +46,7 @@ pub struct DB {
     path: PathBuf,
     lock: Option<FileLock>,
 
-    internal_cmp: Rc<Box<dyn Cmp>>,
+    internal_cmp: Rc<dyn Cmp>,
     fpol: InternalFilterPolicy<BoxedFilterPolicy>,
     opt: Options,
 
@@ -71,7 +71,7 @@ impl DB {
     fn new<P: AsRef<Path>>(name: P, mut opt: Options) -> DB {
         let name = name.as_ref();
         if opt.log.is_none() {
-            let log = open_info_log(opt.env.as_ref().as_ref(), name);
+            let log = open_info_log(opt.env.as_ref(), name);
             opt.log = Some(share(log));
         }
         let path = name.canonicalize().unwrap_or(name.to_owned());
@@ -88,7 +88,7 @@ impl DB {
             name: name.to_owned(),
             path,
             lock: None,
-            internal_cmp: Rc::new(Box::new(InternalKeyCmp(opt.cmp.clone()))),
+            internal_cmp: Rc::new(InternalKeyCmp(opt.cmp.clone())),
             fpol: InternalFilterPolicy::new(opt.filter_policy.clone()),
 
             mem: MemTable::new(opt.cmp.clone()),
@@ -134,7 +134,7 @@ impl DB {
         }
 
         if save_manifest {
-            ve.set_log_num(db.log_num.unwrap_or(0));
+            ve.set_log_num(db.log_num.unwrap_or_else(|| db.vset.borrow().log_num));
             db.vset.borrow_mut().log_and_apply(ve)?;
         }
 
@@ -158,7 +158,7 @@ impl DB {
             lw.add_record(&ve.encode())?;
             lw.flush()?;
         }
-        set_current_file(self.opt.env.as_ref().as_ref(), &self.path, 1)
+        set_current_file(self.opt.env.as_ref(), &self.path, 1)
     }
 
     /// recover recovers from the existing state on disk. If the wrapped result is `true`, then
@@ -171,7 +171,7 @@ impl DB {
         let _ = self.opt.env.mkdir(Path::new(&self.path));
         self.acquire_lock()?;
 
-        if let Err(e) = read_current_file(self.opt.env.as_ref().as_ref(), &self.path) {
+        if let Err(e) = read_current_file(self.opt.env.as_ref(), &self.path) {
             if e.code == StatusCode::NotFound && self.opt.create_if_missing {
                 self.initialize_db()?;
             } else {
@@ -239,7 +239,7 @@ impl DB {
         let filename = log_file_name(&self.path, log_num);
         let logfile = self.opt.env.open_sequential_file(Path::new(&filename))?;
         // Use the user-supplied comparator; it will be wrapped inside a MemtableKeyCmp.
-        let cmp: Rc<Box<dyn Cmp>> = self.opt.cmp.clone();
+        let cmp: Rc<dyn Cmp> = self.opt.cmp.clone();
 
         let mut logreader = LogReader::new(
             logfile, // checksum=
@@ -786,7 +786,7 @@ impl DB {
             };
             let mut state = CompactionState::new(compaction, smallest);
             if let Err(e) = self.do_compaction_work(&mut state) {
-                state.cleanup(self.opt.env.as_ref().as_ref(), &self.path);
+                state.cleanup(self.opt.env.as_ref(), &self.path);
                 log!(self.opt.log, "Compaction work failed: {}", e);
                 return Err(e);
             }
@@ -1214,7 +1214,7 @@ pub mod testutil {
         let mut lw = LogWriter::new(manifest_file);
         lw.add_record(&ve.encode()).unwrap();
         lw.flush().unwrap();
-        set_current_file(opt.env.as_ref().as_ref(), name, 10).unwrap();
+        set_current_file(opt.env.as_ref(), name, 10).unwrap();
 
         (DB::open(name, opt.clone()).unwrap(), opt)
     }
@@ -1897,6 +1897,46 @@ mod tests {
     }
 
     #[test]
+    fn test_db_reopen_with_new_manifest_preserves_log_num() {
+        // Regression test for the log_num fix (yuhangle): when reuse_manifest=false,
+        // vset.recover() returns save_manifest=true, which calls log_and_apply with
+        // the edit's log_number. The log_number must be >= vset.log_num or the
+        // assertion in log_and_apply fires. Previously, unwrap_or(0) would supply 0
+        // on the second open (when log_num is the freshly-created log), causing a
+        // panic because 0 < vset.log_num recovered from the manifest.
+        let opt = options::for_test();
+
+        {
+            // First open: fresh DB, write some data.
+            let mut db = DB::open("rmndb", opt.clone()).unwrap();
+            db.put(b"key1", b"val1").unwrap();
+            db.put(b"key2", b"val2").unwrap();
+        }
+
+        {
+            // Second open: reuse_manifest=false forces save_manifest=true, which
+            // calls log_and_apply with the new log's file number. This is the path
+            // where the original unwrap_or(0) bug would panic.
+            let mut opt2 = opt.clone();
+            opt2.reuse_manifest = false;
+            opt2.reuse_logs = false;
+            let mut db = DB::open("rmndb", opt2).unwrap();
+            assert_eq!(Some(b"val1".to_vec()), db.get(b"key1").map(|b| b.to_vec()));
+            assert_eq!(Some(b"val2".to_vec()), db.get(b"key2").map(|b| b.to_vec()));
+            db.put(b"key3", b"val3").unwrap();
+        }
+
+        {
+            // Third open: verify the manifest written in the second open is valid and
+            // the DB recovers correctly with all three keys present.
+            let mut db = DB::open("rmndb", opt).unwrap();
+            assert_eq!(Some(b"val1".to_vec()), db.get(b"key1").map(|b| b.to_vec()));
+            assert_eq!(Some(b"val2".to_vec()), db.get(b"key2").map(|b| b.to_vec()));
+            assert_eq!(Some(b"val3".to_vec()), db.get(b"key3").map(|b| b.to_vec()));
+        }
+    }
+
+    #[test]
     fn test_compact_range_covers_all_levels() {
         // Regression test: compact_range must reset its key cursor (ifrom)
         // at each level. Without the reset, compacting L1 advances ifrom
@@ -1921,7 +1961,7 @@ mod tests {
         // Create table files on disk.
         let env = opt.env.clone();
         let t1 = write_table(
-            env.as_ref().as_ref(),
+            env.as_ref(),
             &[
                 (b"mmm", b"v1", ValueType::TypeValue),
                 (b"nnn", b"v2", ValueType::TypeValue),
@@ -1931,7 +1971,7 @@ mod tests {
             1,
         );
         let t2 = write_table(
-            env.as_ref().as_ref(),
+            env.as_ref(),
             &[
                 (b"aaa", b"v1", ValueType::TypeValue),
                 (b"bbb", b"v2", ValueType::TypeValue),
@@ -1954,7 +1994,7 @@ mod tests {
         let mut lw = LogWriter::new(mf);
         lw.add_record(&ve.encode()).unwrap();
         lw.flush().unwrap();
-        set_current_file(opt.env.as_ref().as_ref(), name, 9).unwrap();
+        set_current_file(opt.env.as_ref(), name, 9).unwrap();
 
         let mut db = DB::open(name, opt).unwrap();
 
@@ -2010,14 +2050,14 @@ mod tests {
         let env = opt.env.clone();
         // Tombstone for "kkk" with the higher sequence number (newer).
         let t_tomb = write_table(
-            env.as_ref().as_ref(),
+            env.as_ref(),
             &[(b"kkk", b"", ValueType::TypeDeletion)],
             10,
             1,
         );
         // Value "kkk"=v with the lower sequence number (older), in the bottom level.
         let t_val = write_table(
-            env.as_ref().as_ref(),
+            env.as_ref(),
             &[(b"kkk", b"v", ValueType::TypeValue)],
             1,
             2,
@@ -2036,7 +2076,7 @@ mod tests {
         let mut lw = LogWriter::new(mf);
         lw.add_record(&ve.encode()).unwrap();
         lw.flush().unwrap();
-        set_current_file(opt.env.as_ref().as_ref(), name, 9).unwrap();
+        set_current_file(opt.env.as_ref(), name, 9).unwrap();
 
         let mut db = DB::open(name, opt).unwrap();
 
@@ -2092,13 +2132,13 @@ mod tests {
 
         let env = opt.env.clone();
         let t_tomb = write_table(
-            env.as_ref().as_ref(),
+            env.as_ref(),
             &[(b"kkk", b"", ValueType::TypeDeletion)],
             10,
             1,
         );
         let t_val = write_table(
-            env.as_ref().as_ref(),
+            env.as_ref(),
             &[(b"kkk", b"v", ValueType::TypeValue)],
             1,
             2,
@@ -2117,7 +2157,7 @@ mod tests {
         let mut lw = LogWriter::new(mf);
         lw.add_record(&ve.encode()).unwrap();
         lw.flush().unwrap();
-        set_current_file(opt.env.as_ref().as_ref(), name, 9).unwrap();
+        set_current_file(opt.env.as_ref(), name, 9).unwrap();
 
         let mut db = DB::open(name, opt).unwrap();
 
@@ -2170,13 +2210,13 @@ mod tests {
 
         let env = opt.env.clone();
         let t_tomb = write_table(
-            env.as_ref().as_ref(),
+            env.as_ref(),
             &[(b"kkk", b"", ValueType::TypeDeletion)],
             10,
             1,
         );
         let t_val = write_table(
-            env.as_ref().as_ref(),
+            env.as_ref(),
             &[(b"kkk", b"v", ValueType::TypeValue)],
             1,
             2,
@@ -2195,7 +2235,7 @@ mod tests {
         let mut lw = LogWriter::new(mf);
         lw.add_record(&ve.encode()).unwrap();
         lw.flush().unwrap();
-        set_current_file(opt.env.as_ref().as_ref(), name, 9).unwrap();
+        set_current_file(opt.env.as_ref(), name, 9).unwrap();
 
         let mut db = DB::open(name, opt).unwrap();
 
